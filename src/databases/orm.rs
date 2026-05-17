@@ -213,14 +213,117 @@ pub async fn find_one<T: OrmModel>(
 // FIND ALL
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Mengambil semua record dari tabel.
+// ─────────────────────────────────────────────────────────────────────────────
+// FILTER & SEARCH
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Menampung kondisi pencarian dan filter untuk query ORM.
+#[derive(Debug, Default, Clone)]
+pub struct QueryFilter {
+    /// Kondisi `column = value`.
+    pub exact_match: Vec<(String, String)>,
+    /// Kondisi `column LIKE %value%`.
+    pub search_like: Vec<(String, String)>,
+    /// Kondisi `ORDER BY column ASC/DESC`.
+    pub order_by: Option<String>,
+}
+
+impl QueryFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Menambahkan filter pencocokan persis (`column = value`).
+    pub fn exact(mut self, column: &str, value: &str) -> Self {
+        self.exact_match.push((column.to_string(), value.to_string()));
+        self
+    }
+
+    /// Menambahkan filter pencarian string (`column LIKE %value%`).
+    pub fn like(mut self, column: &str, value: &str) -> Self {
+        self.search_like.push((column.to_string(), value.to_string()));
+        self
+    }
+
+    /// Menentukan urutan hasil (misalnya: `"id DESC"`).
+    pub fn order(mut self, order: &str) -> Self {
+        self.order_by = Some(order.to_string());
+        self
+    }
+
+    /// Membangun string `WHERE` dan daftar *binding values*.
+    /// Parameter `start_index` digunakan untuk PostgreSQL (`$1`, `$2`, dll).
+    pub fn build_where_clause(&self, driver: &str, mut start_index: usize) -> (String, Vec<String>, usize) {
+        let mut clauses = Vec::new();
+        let mut bindings = Vec::new();
+
+        for (col, val) in &self.exact_match {
+            if driver == "postgres" {
+                clauses.push(format!("{} = ${}", col, start_index));
+            } else {
+                clauses.push(format!("{} = ?", col));
+            }
+            bindings.push(val.clone());
+            start_index += 1;
+        }
+
+        for (col, val) in &self.search_like {
+            if driver == "postgres" {
+                clauses.push(format!("{} LIKE ${}", col, start_index));
+            } else {
+                clauses.push(format!("{} LIKE ?", col));
+            }
+            // Tambahkan wildcards untuk LIKE
+            bindings.push(format!("%{}%", val));
+            start_index += 1;
+        }
+
+        let where_clause = if clauses.is_empty() {
+            "".to_string()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+
+        (where_clause, bindings, start_index)
+    }
+
+    pub fn build_order_clause(&self) -> String {
+        match &self.order_by {
+            Some(o) => format!("ORDER BY {}", o),
+            None => "".to_string(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIND ALL
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Mengambil semua record dari tabel dengan opsional filter dan pencarian.
 pub async fn find_all<T: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
+    filter: Option<&QueryFilter>,
 ) -> Result<Vec<T>, sqlx::Error> {
-    let sql = format!("SELECT * FROM {}", T::TABLE);
+    let table = T::TABLE;
+    
+    let (where_clause, bindings, _) = if let Some(f) = filter {
+        f.build_where_clause(driver, 1)
+    } else {
+        ("".to_string(), vec![], 1)
+    };
+
+    let order_clause = filter.map(|f| f.build_order_clause()).unwrap_or_default();
+
+    let sql = format!("SELECT * FROM {} {} {}", table, where_clause, order_clause);
     println!("[ORM] FIND ALL SQL: {}", sql);
 
-    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let mut query = sqlx::query(&sql);
+    for b in bindings {
+        query = query.bind(b);
+    }
+
+    let rows = query.fetch_all(pool).await?;
     let results = rows
         .into_iter()
         .map(|r| T::from_row(r))
@@ -236,54 +339,68 @@ pub async fn find_all<T: OrmModel>(
 /// Hasil query dengan paginasi.
 #[derive(Debug)]
 pub struct PaginatedResult<T> {
-    /// Data pada halaman ini.
     pub data: Vec<T>,
-    /// Halaman saat ini (dimulai dari 1).
     pub page: u64,
-    /// Jumlah record per halaman.
     pub per_page: u64,
-    /// Total record yang tersedia.
     pub total: u64,
-    /// Total halaman yang tersedia.
     pub total_pages: u64,
 }
 
-/// Mengambil record dengan paginasi.
-///
-/// # Arguments
-/// * `page` - Nomor halaman, dimulai dari 1.
-/// * `per_page` - Jumlah data per halaman.
+/// Mengambil record dengan paginasi dan filter opsional.
 pub async fn find_paginated<T: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     page: u64,
     per_page: u64,
+    filter: Option<&QueryFilter>,
 ) -> Result<PaginatedResult<T>, sqlx::Error> {
     let table = T::TABLE;
 
-    // Hitung total record
-    let count_sql = format!("SELECT COUNT(*) as count FROM {}", table);
-    let count_row = sqlx::query(&count_sql).fetch_one(pool).await?;
+    let (where_clause, bindings, next_index) = if let Some(f) = filter {
+        f.build_where_clause(driver, 1)
+    } else {
+        ("".to_string(), vec![], 1)
+    };
+    let order_clause = filter.map(|f| f.build_order_clause()).unwrap_or_default();
+
+    // 1. Hitung total record sesuai filter
+    let count_sql = format!("SELECT COUNT(*) as count FROM {} {}", table, where_clause);
+    let mut count_query = sqlx::query(&count_sql);
+    for b in &bindings {
+        count_query = count_query.bind(b);
+    }
+    let count_row = count_query.fetch_one(pool).await?;
     let total: i64 = count_row.try_get("count")?;
     let total = total as u64;
 
-    // Hitung offset
+    // 2. Hitung limit dan offset
     let page = page.max(1);
     let offset = (page - 1) * per_page;
     let total_pages = total.div_ceil(per_page);
 
-    // Query data
+    // 3. Query data
+    let (limit_ph, offset_ph) = if driver == "postgres" {
+        let l = format!("${}", next_index);
+        let o = format!("${}", next_index + 1);
+        (l, o)
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+
     let sql = format!(
-        "SELECT * FROM {} LIMIT ? OFFSET ?",
-        table
+        "SELECT * FROM {} {} {} LIMIT {} OFFSET {}",
+        table, where_clause, order_clause, limit_ph, offset_ph
     );
-    println!("[ORM] PAGINATED SQL: {} (limit={}, offset={})", sql, per_page, offset);
+    println!("[ORM] PAGINATED SQL: {}", sql);
 
-    let rows = sqlx::query(&sql)
-        .bind(per_page as i64)
-        .bind(offset as i64)
-        .fetch_all(pool)
-        .await?;
+    let mut data_query = sqlx::query(&sql);
+    for b in bindings {
+        data_query = data_query.bind(b);
+    }
+    data_query = data_query.bind(per_page as i64);
+    data_query = data_query.bind(offset as i64);
 
+    let rows = data_query.fetch_all(pool).await?;
     let data = rows
         .into_iter()
         .map(|r| T::from_row(r))

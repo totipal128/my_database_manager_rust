@@ -264,7 +264,7 @@ impl OrmModel for Product {
 ```rust
 use my_database_manager::{
     insert, update, delete,
-    find_one, find_all, find_paginated,
+    find_one, find_all, find_paginated, QueryFilter,
 };
 
 // INSERT
@@ -281,11 +281,18 @@ delete::<Product>(&pool, 1).await?;
 // FIND ONE berdasarkan id
 let result: Option<Product> = find_one::<Product>(&pool, 1).await?;
 
-// FIND ALL
-let all: Vec<Product> = find_all::<Product>(&pool).await?;
+// FIND ALL (tanpa filter)
+let all: Vec<Product> = find_all::<Product>(&pool, &config.driver, None).await?;
 
-// FIND PAGINATED (halaman ke-2, 10 data per halaman)
-let page = find_paginated::<Product>(&pool, 2, 10).await?;
+// FIND PAGINATED DENGAN FILTER & SEARCH
+// Mencari produk yang mengandung kata "Apple", stok persis 10, urutkan harga menurun
+let filter = QueryFilter::new()
+    .like("name", "Apple")
+    .exact("stock", "10")
+    .order("price DESC");
+
+// Ambil halaman ke-1, 10 data per halaman
+let page = find_paginated::<Product>(&pool, &config.driver, 1, 10, Some(&filter)).await?;
 println!("Total: {}, Halaman: {}/{}", page.total, page.page, page.total_pages);
 for item in page.data {
     println!("  - {:?}", item);

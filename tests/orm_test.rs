@@ -1,5 +1,5 @@
 use my_database_manager::{
-    DatabaseConfig, Model, OrmModel,
+    DatabaseConfig, Model, OrmModel, QueryFilter,
     create_table, setup_database,
     insert, update, delete, find_one, find_all, find_paginated,
 };
@@ -157,7 +157,7 @@ async fn test_orm_find_all() {
             .execute(&pool).await.unwrap();
     }
 
-    let all = find_all::<Product>(&pool).await.unwrap();
+    let all = find_all::<Product>(&pool, "sqlite", None).await.unwrap();
     assert_eq!(all.len(), 5, "Harus ada 5 data");
     assert_eq!(all[0].name, "Product 1");
     assert_eq!(all[4].name, "Product 5");
@@ -182,7 +182,7 @@ async fn test_orm_find_paginated() {
     }
 
     // Halaman 1: 3 data per halaman
-    let page1 = find_paginated::<Product>(&pool, 1, 3).await.unwrap();
+    let page1 = find_paginated::<Product>(&pool, "sqlite", 1, 3, None).await.unwrap();
     assert_eq!(page1.data.len(), 3, "Halaman 1 harus berisi 3 data");
     assert_eq!(page1.page, 1);
     assert_eq!(page1.per_page, 3);
@@ -191,11 +191,52 @@ async fn test_orm_find_paginated() {
     println!("[test_orm_paginated] Page 1: {:?}", page1.data.iter().map(|p| &p.name).collect::<Vec<_>>());
 
     // Halaman 2
-    let page2 = find_paginated::<Product>(&pool, 2, 3).await.unwrap();
+    let page2 = find_paginated::<Product>(&pool, "sqlite", 2, 3, None).await.unwrap();
     assert_eq!(page2.data.len(), 3, "Halaman 2 harus berisi 3 data");
     assert_eq!(page2.page, 2);
 
     // Halaman terakhir (halaman 4): hanya 1 data
-    let page4 = find_paginated::<Product>(&pool, 4, 3).await.unwrap();
+    let page4 = find_paginated::<Product>(&pool, "sqlite", 4, 3, None).await.unwrap();
     assert_eq!(page4.data.len(), 1, "Halaman terakhir harus berisi 1 data");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test: FILTER & SEARCH
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_orm_find_with_filter() {
+    let pool = setup_test_db("test_orm_filter.sqlite").await;
+
+    // Insert data
+    sqlx::query("INSERT INTO products (id, name, price, stock) VALUES (1, 'Apple MacBook', 1500.0, 10)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO products (id, name, price, stock) VALUES (2, 'Apple iPhone', 1000.0, 50)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO products (id, name, price, stock) VALUES (3, 'Samsung Galaxy', 900.0, 30)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO products (id, name, price, stock) VALUES (4, 'Apple iPad', 800.0, 20)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO products (id, name, price, stock) VALUES (5, 'Sony Headphones', 300.0, 100)").execute(&pool).await.unwrap();
+
+    // 1. EXACT match (stock = 10)
+    let filter1 = QueryFilter::new().exact("stock", "10");
+    let res1 = find_all::<Product>(&pool, "sqlite", Some(&filter1)).await.unwrap();
+    assert_eq!(res1.len(), 1);
+    assert_eq!(res1[0].name, "Apple MacBook");
+
+    // 2. LIKE search (name LIKE '%Apple%') + ORDER BY price DESC
+    let filter2 = QueryFilter::new()
+        .like("name", "Apple")
+        .order("price DESC");
+    let res2 = find_all::<Product>(&pool, "sqlite", Some(&filter2)).await.unwrap();
+    assert_eq!(res2.len(), 3, "Harus ada 3 produk Apple");
+    assert_eq!(res2[0].name, "Apple MacBook", "Paling mahal di atas");
+    assert_eq!(res2[2].name, "Apple iPad", "Paling murah di bawah");
+
+    // 3. Kombinasi EXACT & LIKE dalam Paginated Result
+    let filter3 = QueryFilter::new()
+        .like("name", "a") // MacBook, Galaxy, iPad, Headphones (semua ada 'a')
+        .order("id ASC");
+    let page1 = find_paginated::<Product>(&pool, "sqlite", 1, 2, Some(&filter3)).await.unwrap();
+    
+    assert_eq!(page1.data.len(), 2, "Halaman 1 berisi 2 data");
+    assert_eq!(page1.data[0].id, 1, "MacBook");
+    assert_eq!(page1.data[1].id, 2, "iPhone memiliki 'a' di 'Apple'");
 }
