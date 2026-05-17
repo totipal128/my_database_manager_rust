@@ -303,3 +303,205 @@ for item in page.data {
 | `total_pages` | `u64` | Total halaman tersedia |
 
 > **Catatan:** Nilai pada `insert_values()` dan `update_values()` dikirim sebagai `String` dan akan di-cast oleh database. Untuk performa optimal di PostgreSQL, gunakan tipe yang sesuai.
+
+---
+
+## 7. ORM Relasional — Get Data Berdasarkan Relasi
+
+Library ini menyediakan fungsi-fungsi untuk mengambil data berdasarkan relasi antar tabel:
+**One-to-Many**, **Many-to-Many**, dan **eager loading** (parent + children sekaligus).
+
+### Setup Contoh Model
+
+```rust
+use my_database_manager::{Model, OrmModel};
+use sqlx::{Row, any::AnyRow};
+
+// ── Parent: User ────────────────────────────────────────────────
+#[derive(Debug, Clone, Model)]
+#[table("users")]
+pub struct User {
+    id: i32,
+    name: String,
+}
+
+impl OrmModel for User {
+    fn get_id(&self) -> i64 { self.id as i64 }
+    fn insert_values(&self) -> Vec<String> { vec![self.name.clone()] }
+    fn from_row(row: AnyRow) -> Result<Self, sqlx::Error> {
+        Ok(User { id: row.try_get("id")?, name: row.try_get("name")? })
+    }
+}
+
+// ── Child: Post (berelasi ke User via user_id) ───────────────────
+#[derive(Debug, Clone, Model)]
+#[table("posts")]
+pub struct Post {
+    id: i32,
+    title: String,
+    user_id: i32,
+}
+
+impl OrmModel for Post {
+    fn get_id(&self) -> i64 { self.id as i64 }
+    fn insert_values(&self) -> Vec<String> {
+        vec![self.title.clone(), self.user_id.to_string()]
+    }
+    fn from_row(row: AnyRow) -> Result<Self, sqlx::Error> {
+        Ok(Post {
+            id: row.try_get("id")?,
+            title: row.try_get("title")?,
+            user_id: row.try_get("user_id")?,
+        })
+    }
+}
+
+// ── Role (untuk relasi Many-to-Many dengan User) ─────────────────
+#[derive(Debug, Clone, Model)]
+#[table("roles")]
+pub struct Role {
+    id: i32,
+    name: String,
+}
+
+impl OrmModel for Role {
+    fn get_id(&self) -> i64 { self.id as i64 }
+    fn insert_values(&self) -> Vec<String> { vec![self.name.clone()] }
+    fn from_row(row: AnyRow) -> Result<Self, sqlx::Error> {
+        Ok(Role { id: row.try_get("id")?, name: row.try_get("name")? })
+    }
+}
+```
+
+---
+
+### `find_by` — Filter Berdasarkan Kolom (termasuk FK)
+
+Mengambil semua record di mana `column = value`. Paling sederhana untuk filter FK.
+
+```rust
+use my_database_manager::find_by;
+
+// Ambil semua Post milik user_id = 5
+let posts: Vec<Post> = find_by::<Post>(&pool, "user_id", "5").await?;
+
+// Ambil semua User dengan nama "Alice"
+let users: Vec<User> = find_by::<User>(&pool, "name", "Alice").await?;
+```
+
+---
+
+### `find_by_paginated` — Filter dengan Paginasi
+
+```rust
+use my_database_manager::find_by_paginated;
+
+// Ambil halaman 1 dari semua Post milik user_id = 5 (10 per halaman)
+let result = find_by_paginated::<Post>(&pool, "user_id", "5", 1, 10).await?;
+
+println!("Post user 5 — halaman {}/{}", result.page, result.total_pages);
+println!("Total: {} post", result.total);
+for post in result.data {
+    println!("  - {}", post.title);
+}
+```
+
+---
+
+### `find_related` — One-to-Many
+
+Mengambil semua record *Child* yang berelasi ke satu *Parent* melalui *foreign key*.
+
+```rust
+use my_database_manager::find_related;
+
+// Ambil semua Post milik User dengan id = 3
+let posts: Vec<Post> = find_related::<Post>(&pool, "user_id", 3).await?;
+
+println!("User 3 memiliki {} post:", posts.len());
+for p in &posts {
+    println!("  - {} (id={})", p.title, p.id);
+}
+```
+
+---
+
+### `find_one_with_related` — Eager Load (Parent + Children)
+
+Mengambil satu record *Parent* sekaligus semua *Children* miliknya dalam satu panggilan.
+Hasilnya dikemas dalam struct `WithChildren<P, C>`.
+
+```rust
+use my_database_manager::{find_one_with_related, WithChildren};
+
+// Ambil User id=1 beserta semua Post miliknya
+let result: Option<WithChildren<User, Post>> =
+    find_one_with_related::<User, Post>(&pool, 1, "user_id").await?;
+
+match result {
+    None => println!("User tidak ditemukan"),
+    Some(data) => {
+        println!("User  : {:?}", data.parent);
+        println!("Posts ({}):", data.children.len());
+        for post in &data.children {
+            println!("  - {}", post.title);
+        }
+    }
+}
+```
+
+#### Struct `WithChildren<P, C>`
+
+| Field | Tipe | Keterangan |
+| --- | --- | --- |
+| `parent` | `P` | Record parent (misalnya: `User`) |
+| `children` | `Vec<C>` | Semua child yang berelasi (misalnya: `Vec<Post>`) |
+
+---
+
+### `find_many_to_many` — Many-to-Many via Pivot Table
+
+Mengambil semua record `T` yang terhubung melalui tabel pivot.
+
+**Skema pivot yang diperlukan:**
+
+```sql
+CREATE TABLE user_roles (
+    user_id INTEGER NOT NULL,
+    role_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, role_id)
+);
+```
+
+```rust
+use my_database_manager::find_many_to_many;
+
+// Ambil semua Role milik User id = 5
+// pivot_table = "user_roles"
+// pivot_fk    = "role_id"   ← kolom yang menunjuk ke tabel Role
+// pivot_ref   = "user_id"   ← kolom yang menjadi filter
+let roles: Vec<Role> = find_many_to_many::<Role>(
+    &pool,
+    "user_roles",   // tabel pivot
+    "role_id",      // FK ke tabel target (roles.id)
+    "user_id",      // kolom filter
+    5,              // nilai user_id yang dicari
+).await?;
+
+println!("User 5 memiliki {} role:", roles.len());
+for r in &roles {
+    println!("  - {}", r.name);
+}
+```
+
+---
+
+### Ringkasan Fungsi Relasional
+
+| Fungsi | Relasi | Keterangan |
+| --- | --- | --- |
+| `find_by::<T>(pool, column, value)` | Filter kolom apa saja | Cari semua T di mana kolom = nilai |
+| `find_by_paginated::<T>(pool, col, val, page, size)` | Filter + paginasi | Versi paginated dari `find_by` |
+| `find_related::<Child>(pool, fk_column, parent_id)` | One-to-Many | Ambil semua Child milik satu Parent |
+| `find_one_with_related::<P, C>(pool, id, fk)` | One-to-Many eager load | Parent + semua Children sekaligus |
+| `find_many_to_many::<T>(pool, pivot, pivot_fk, pivot_ref, id)` | Many-to-Many | Ambil T melalui tabel pivot |
