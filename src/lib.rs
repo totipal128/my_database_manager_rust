@@ -4,7 +4,7 @@ pub use databases::driver::DatabaseConfig;
 pub use databases::create_databases::setup_database;
 pub use databases::create_table::{Model, create_table, sync_table};
 pub use databases::orm::{
-    OrmModel, PaginatedResult, WithChildren, QueryFilter,
+    OrmModel, DbValue, PaginatedResult, WithChildren, QueryFilter,
     insert, update, delete,
     find_one, find_all, find_paginated,
     find_by, find_by_paginated,

@@ -27,7 +27,7 @@ fn extract_type_info(ty: &Type) -> (&'static str, bool) {
                 "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => "INT",
                 "i64" | "u64" | "isize" | "usize" => "BIGINT",
                 "f32" => "FLOAT",
-                "f64" => "DOUBLE",
+                "f64" => "DOUBLE PRECISION",
                 "bool" => "BOOLEAN",
                 "String" | "str" => "VARCHAR(255)",
                 "NaiveDate" => "DATE",

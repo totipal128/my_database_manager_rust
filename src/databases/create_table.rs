@@ -8,7 +8,7 @@ pub trait Model: Sized + Clone + std::fmt::Debug {
     const FOREIGN_KEYS: &'static [&'static str] = &[];
 }
 
-pub async fn create_table<T: Model>(pool: &Pool<Any>) -> Result<(), sqlx::Error> {
+pub async fn create_table<T: Model>(pool: &Pool<Any>, driver: &str) -> Result<(), sqlx::Error> {
     let table_name = T::TABLE;
     let field_declarations = T::FIELDS_DECLARATION.join(",\n            ");
     let foreign_keys = T::FOREIGN_KEYS.join(",\n            ");
@@ -18,6 +18,22 @@ pub async fn create_table<T: Model>(pool: &Pool<Any>) -> Result<(), sqlx::Error>
     } else {
         field_declarations
     };
+
+    // Auto-increment replacement based on driver
+    let clean_driver = driver.to_lowercase();
+    if clean_driver == "sqlite" {
+        columns_sql = columns_sql.replace("id INT PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT");
+        columns_sql = columns_sql.replace("DOUBLE PRECISION", "REAL");
+        // SQLite tidak punya tipe BOOLEAN native, INTEGER affinity
+        columns_sql = columns_sql.replace("BOOLEAN", "INTEGER");
+    } else if clean_driver == "mysql" || clean_driver == "mariadb" {
+        columns_sql = columns_sql.replace("id INT PRIMARY KEY", "id INT AUTO_INCREMENT PRIMARY KEY");
+        // sqlx::Any driver tidak mendukung MySQL TINYINT (tipe BOOLEAN di MySQL)
+        columns_sql = columns_sql.replace("BOOLEAN", "INT");
+    } else if clean_driver == "postgres" || clean_driver == "postgresql" {
+        columns_sql = columns_sql.replace("id INT PRIMARY KEY", "id SERIAL PRIMARY KEY");
+        columns_sql = columns_sql.replace("DATETIME", "TIMESTAMP");
+    }
 
     if !foreign_keys.is_empty() {
         columns_sql.push_str(",\n            ");
@@ -59,30 +75,60 @@ pub async fn sync_table<T: Model>(pool: &Pool<Any>, driver: &str) -> Result<(), 
         let query = format!("PRAGMA table_info('{}')", table_name);
         if let Ok(rows) = sqlx::query(&query).fetch_all(pool).await {
             for row in rows {
+                // PRAGMA table_info: kolom index 1 = "name"
                 if let Ok(name) = row.try_get::<String, _>("name") {
                     existing_columns.push(name.to_lowercase());
                 }
             }
         }
     } else {
-        // Postgres & MySQL menggunakan information_schema
+        // Postgres & MySQL menggunakan information_schema dengan filter schema aktif
+        let schema_filter = if driver == "mysql" || driver == "mariadb" {
+            "AND table_schema = DATABASE()"
+        } else if driver == "postgres" || driver == "postgresql" {
+            "AND table_schema = current_schema()"
+        } else {
+            ""
+        };
+        // Cast column_name::TEXT for PostgreSQL compatibility (column_name is type `Name`
+        // which sqlx::Any driver can't decode)
+        let col_expr = if driver == "postgres" || driver == "postgresql" {
+            "column_name::TEXT AS col_name"
+        } else {
+            "column_name AS col_name"
+        };
         let query = format!(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = '{}' OR table_name = '{}'", 
-            table_name, table_name.to_lowercase()
+            "SELECT {} FROM information_schema.columns WHERE (table_name = '{}' OR table_name = '{}') {}", 
+            col_expr, table_name, table_name.to_lowercase(), schema_filter
         );
-        if let Ok(rows) = sqlx::query(&query).fetch_all(pool).await {
-            for row in rows {
-                if let Ok(name) = row.try_get::<String, _>("column_name") {
-                    existing_columns.push(name.to_lowercase());
+        match sqlx::query(&query).fetch_all(pool).await {
+            Ok(rows) => {
+                for row in rows {
+                    // Gunakan index kolom 0 agar tidak tergantung nama kolom
+                    // (MySQL mengembalikan COLUMN_NAME uppercase, sqlx Any mungkin case-sensitive)
+                    if let Ok(name) = row.try_get::<String, usize>(0) {
+                        existing_columns.push(name.to_lowercase());
+                    }
                 }
+            }
+            Err(e) => {
+                println!("[sync_table] Warning: Gagal query columns untuk tabel '{}': {}", table_name, e);
             }
         }
     }
 
-    // Jika tabel belum ada, buat baru
+    // Jika tabel belum ada (atau info_schema tidak menemukan kolom), buat baru
     if existing_columns.is_empty() {
         println!("Tabel '{}' tidak ditemukan, membuat baru...", table_name);
-        return create_table::<T>(pool).await;
+        // DROP dulu untuk memastikan tidak ada tabel "hantu" tanpa AUTO_INCREMENT
+        // dari sesi sebelumnya yang menyebabkan CREATE TABLE IF NOT EXISTS menjadi no-op
+        let drop_sql = if driver == "postgres" || driver == "postgresql" {
+            format!("DROP TABLE IF EXISTS {} CASCADE", table_name)
+        } else {
+            format!("DROP TABLE IF EXISTS {}", table_name)
+        };
+        let _ = sqlx::query(&drop_sql).execute(pool).await;
+        return create_table::<T>(pool, driver).await;
     }
 
     // 3. Tambahkan kolom yang ada di Struct tapi belum ada di Database
@@ -90,7 +136,12 @@ pub async fn sync_table<T: Model>(pool: &Pool<Any>, driver: &str) -> Result<(), 
         if let Some(col_name) = decl.split_whitespace().next() {
             let clean_name = col_name.replace("`", "").replace("\"", "").to_lowercase();
             if !existing_columns.contains(&clean_name) {
-                let alter_query = format!("ALTER TABLE {} ADD COLUMN {}", table_name, decl);
+                // Hapus NOT NULL untuk ALTER TABLE karena menambah kolom NOT NULL
+                // ke tabel yang sudah ada datanya akan gagal di semua engine (SQLite, PG, MySQL)
+                let mutable_decl = decl
+                    .replace(" NOT NULL", "")
+                    .replace("NOT NULL", "");
+                let alter_query = format!("ALTER TABLE {} ADD COLUMN {}", table_name, mutable_decl);
                 println!("Menambah kolom baru: {}", alter_query);
                 if let Err(e) = sqlx::query(&alter_query).execute(pool).await {
                     println!("Warning: Gagal menambah kolom '{}': {}", clean_name, e);

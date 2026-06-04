@@ -1,7 +1,16 @@
-use sqlx::{pool::Pool, Any, Row};
 use sqlx::any::AnyRow;
+use sqlx::{Any, Row, pool::Pool};
 
 use crate::databases::create_table::Model;
+
+#[derive(Debug, Clone)]
+pub enum DbValue {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRAIT OrmModel
@@ -14,7 +23,7 @@ use crate::databases::create_table::Model;
 ///
 /// # Contoh
 /// ```rust
-/// use my_database_manager::{Model, OrmModel};
+/// use my_database_manager::{Model, OrmModel, DbValue};
 /// use sqlx::any::AnyRow;
 /// use sqlx::Row;
 ///
@@ -28,11 +37,14 @@ use crate::databases::create_table::Model;
 /// impl OrmModel for User {
 ///     fn get_id(&self) -> i64 { self.id as i64 }
 ///
-///     fn insert_values(&self) -> Vec<String> {
-///         vec![self.username.clone(), self.email.clone().unwrap_or_default()]
+///     fn insert_values(&self) -> Vec<DbValue> {
+///         vec![
+///             DbValue::String(self.username.clone()),
+///             DbValue::String(self.email.clone().unwrap_or_default()),
+///         ]
 ///     }
 ///
-///     fn update_values(&self) -> Vec<String> {
+///     fn update_values(&self) -> Vec<DbValue> {
 ///         self.insert_values()
 ///     }
 ///
@@ -50,11 +62,11 @@ pub trait OrmModel: Model {
     fn get_id(&self) -> i64;
 
     /// Mengembalikan nilai-nilai untuk INSERT, sesuai urutan `FIELDS_INSERT`.
-    fn insert_values(&self) -> Vec<String>;
+    fn insert_values(&self) -> Vec<DbValue>;
 
     /// Mengembalikan nilai-nilai untuk UPDATE, sesuai urutan `FIELDS_INSERT`.
     /// Secara default sama dengan `insert_values()`.
-    fn update_values(&self) -> Vec<String> {
+    fn update_values(&self) -> Vec<DbValue> {
         self.insert_values()
     }
 
@@ -72,14 +84,21 @@ pub trait OrmModel: Model {
 fn make_placeholders(count: usize, driver: &str) -> String {
     (1..=count)
         .map(|i| {
-            if driver == "postgres" {
-                format!("${}", i)
-            } else {
-                "?".to_string()
-            }
+            ph(i, driver)
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Menghasilkan satu placeholder SQL.
+/// - PostgreSQL: `$1`, `$2`, dll
+/// - Lainnya (SQLite/MySQL): `?`
+fn ph(index: usize, driver: &str) -> String {
+    if driver == "postgres" || driver == "postgresql" {
+        format!("${}", index)
+    } else {
+        "?".to_string()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,11 +123,29 @@ pub async fn insert<T: OrmModel>(
         table, fields, placeholders
     );
 
+    // println!("[ORM] FIELDS INSERT SQL: {}", fields);
+    // println!("[ORM] VALUES INSERT SQL: {:?}", values);
     println!("[ORM] INSERT SQL: {}", sql);
 
     let mut query = sqlx::query(&sql);
     for val in &values {
-        query = query.bind(val.as_str());
+        query = match val {
+            DbValue::String(v) => query.bind(v),
+
+            DbValue::Int(v) => query.bind(v),
+
+            DbValue::Float(v) => query.bind(v),
+
+            DbValue::Bool(v) => {
+                if driver == "mysql" {
+                    query.bind(if *v { 1i32 } else { 0i32 })
+                } else {
+                    query.bind(v)
+                }
+            }
+
+            DbValue::Null => query.bind(None::<String>),
+        };
     }
     query.execute(pool).await?;
 
@@ -160,7 +197,23 @@ pub async fn update<T: OrmModel>(
 
     let mut query = sqlx::query(&sql);
     for val in &values {
-        query = query.bind(val.as_str());
+        query = match val {
+            DbValue::String(v) => query.bind(v),
+
+            DbValue::Int(v) => query.bind(v),
+
+            DbValue::Float(v) => query.bind(v),
+
+            DbValue::Bool(v) => {
+                if driver == "mysql" {
+                    query.bind(if *v { 1i32 } else { 0i32 })
+                } else {
+                    query.bind(v)
+                }
+            }
+
+            DbValue::Null => query.bind(None::<String>),
+        };
     }
     query = query.bind(id);
     query.execute(pool).await?;
@@ -173,11 +226,8 @@ pub async fn update<T: OrmModel>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Menghapus record berdasarkan `id`.
-pub async fn delete<T: OrmModel>(
-    pool: &Pool<Any>,
-    id: i64,
-) -> Result<(), sqlx::Error> {
-    let sql = format!("DELETE FROM {} WHERE id = ?", T::TABLE);
+pub async fn delete<T: OrmModel>(pool: &Pool<Any>, driver: &str, id: i64) -> Result<(), sqlx::Error> {
+    let sql = format!("DELETE FROM {} WHERE id = {}", T::TABLE, ph(1, driver));
     println!("[ORM] DELETE SQL: {}", sql);
 
     sqlx::query(&sql).bind(id).execute(pool).await?;
@@ -191,17 +241,11 @@ pub async fn delete<T: OrmModel>(
 /// Mencari satu record berdasarkan `id`.
 ///
 /// Mengembalikan `None` jika tidak ditemukan.
-pub async fn find_one<T: OrmModel>(
-    pool: &Pool<Any>,
-    id: i64,
-) -> Result<Option<T>, sqlx::Error> {
-    let sql = format!("SELECT * FROM {} WHERE id = ? LIMIT 1", T::TABLE);
-    println!("[ORM] FIND ONE SQL: {}", sql);
+pub async fn find_one<T: OrmModel>(pool: &Pool<Any>, driver: &str, id: i64) -> Result<Option<T>, sqlx::Error> {
+    let sql = format!("SELECT * FROM {} WHERE id = {} LIMIT 1", T::TABLE, ph(1, driver));
+    println!("[ORM] FIND ONE SQL: {} | {}  ", sql, id);
 
-    let row = sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
 
     match row {
         Some(r) => Ok(Some(T::from_row(r)?)),
@@ -215,15 +259,15 @@ pub async fn find_one<T: OrmModel>(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FILTER & SEARCH
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Menampung kondisi pencarian dan filter untuk query ORM.
+// ─────────────────────────────────────────────────────────────────────────────    /// Menampung kondisi pencarian dan filter untuk query ORM.
 #[derive(Debug, Default, Clone)]
 pub struct QueryFilter {
     /// Kondisi `column = value`.
-    pub exact_match: Vec<(String, String)>,
-    /// Kondisi `column LIKE %value%`.
+    pub exact_match: Vec<(String, DbValue)>,
+    /// Kondisi `column LIKE %value%` (case-sensitive sesuai database).
     pub search_like: Vec<(String, String)>,
+    /// Kondisi `LOWER(column) LIKE %value%` (case-insensitive).
+    pub search_like_lower: Vec<(String, String)>,
     /// Kondisi `ORDER BY column ASC/DESC`.
     pub order_by: Option<String>,
 }
@@ -233,15 +277,38 @@ impl QueryFilter {
         Self::default()
     }
 
-    /// Menambahkan filter pencocokan persis (`column = value`).
+    /// Menambahkan filter pencocokan persis teks (`column = value`).
     pub fn exact(mut self, column: &str, value: &str) -> Self {
-        self.exact_match.push((column.to_string(), value.to_string()));
+        self.exact_match
+            .push((column.to_string(), DbValue::String(value.to_string())));
+        self
+    }
+
+    /// Menambahkan filter pencocokan persis integer (`column = value`).
+    pub fn exact_int(mut self, column: &str, value: i64) -> Self {
+        self.exact_match
+            .push((column.to_string(), DbValue::Int(value)));
+        self
+    }
+
+    /// Menambahkan filter pencocokan persis boolean (`column = value`).
+    pub fn exact_bool(mut self, column: &str, value: bool) -> Self {
+        self.exact_match
+            .push((column.to_string(), DbValue::Bool(value)));
         self
     }
 
     /// Menambahkan filter pencarian string (`column LIKE %value%`).
     pub fn like(mut self, column: &str, value: &str) -> Self {
-        self.search_like.push((column.to_string(), value.to_string()));
+        self.search_like
+            .push((column.to_string(), value.to_string()));
+        self
+    }
+
+    /// Menambahkan filter pencarian case-insensitive (`LOWER(column) LIKE %value%`).
+    pub fn like_lower(mut self, column: &str, value: &str) -> Self {
+        self.search_like_lower
+            .push((column.to_string(), value.to_lowercase()));
         self
     }
 
@@ -253,28 +320,57 @@ impl QueryFilter {
 
     /// Membangun string `WHERE` dan daftar *binding values*.
     /// Parameter `start_index` digunakan untuk PostgreSQL (`$1`, `$2`, dll).
-    pub fn build_where_clause(&self, driver: &str, mut start_index: usize) -> (String, Vec<String>, usize) {
+    pub fn build_where_clause(
+        &self,
+        driver: &str,
+        mut start_index: usize,
+    ) -> (String, Vec<DbValue>, usize) {
         let mut clauses = Vec::new();
         let mut bindings = Vec::new();
+        let is_pg = driver == "postgres" || driver == "postgresql";
 
         for (col, val) in &self.exact_match {
-            if driver == "postgres" {
-                clauses.push(format!("{} = ${}", col, start_index));
-            } else {
-                clauses.push(format!("{} = ?", col));
-            }
+            let ph = if is_pg { format!("${}", start_index) } else { "?".to_string() };
+            let clause = match val {
+                DbValue::Bool(_) => {
+                    if is_pg {
+                        format!("{} = CAST({} AS BOOLEAN)", col, ph)
+                    } else {
+                        format!("{} = {}", col, ph)
+                    }
+                }
+                DbValue::Int(_) => {
+                    if is_pg {
+                        format!("{} = CAST({} AS INTEGER)", col, ph)
+                    } else {
+                        format!("{} = {}", col, ph)
+                    }
+                }
+                _ => format!("{} = {}", col, ph),
+            };
+            clauses.push(clause);
             bindings.push(val.clone());
             start_index += 1;
         }
 
         for (col, val) in &self.search_like {
-            if driver == "postgres" {
+            if is_pg {
                 clauses.push(format!("{} LIKE ${}", col, start_index));
             } else {
                 clauses.push(format!("{} LIKE ?", col));
             }
             // Tambahkan wildcards untuk LIKE
-            bindings.push(format!("%{}%", val));
+            bindings.push(DbValue::String(format!("%{}%", val)));
+            start_index += 1;
+        }
+
+        for (col, val) in &self.search_like_lower {
+            if is_pg {
+                clauses.push(format!("LOWER({}) LIKE ${}", col, start_index));
+            } else {
+                clauses.push(format!("LOWER({}) LIKE ?", col));
+            }
+            bindings.push(DbValue::String(format!("%{}%", val)));
             start_index += 1;
         }
 
@@ -306,7 +402,7 @@ pub async fn find_all<T: OrmModel>(
     filter: Option<&QueryFilter>,
 ) -> Result<Vec<T>, sqlx::Error> {
     let table = T::TABLE;
-    
+
     let (where_clause, bindings, _) = if let Some(f) = filter {
         f.build_where_clause(driver, 1)
     } else {
@@ -317,10 +413,23 @@ pub async fn find_all<T: OrmModel>(
 
     let sql = format!("SELECT * FROM {} {} {}", table, where_clause, order_clause);
     println!("[ORM] FIND ALL SQL: {}", sql);
+    println!("[ORM] FIND ALL BINDINGS: {:?}", bindings);
 
     let mut query = sqlx::query(&sql);
     for b in bindings {
-        query = query.bind(b);
+        query = match b {
+            DbValue::String(v) => query.bind(v),
+            DbValue::Int(v) => query.bind(v),
+            DbValue::Float(v) => query.bind(v),
+            DbValue::Bool(v) => {
+                if driver == "mysql" {
+                    query.bind(if v { 1i32 } else { 0i32 })
+                } else {
+                    query.bind(v)
+                }
+            }
+            DbValue::Null => query.bind(None::<String>),
+        };
     }
 
     let rows = query.fetch_all(pool).await?;
@@ -367,7 +476,19 @@ pub async fn find_paginated<T: OrmModel>(
     let count_sql = format!("SELECT COUNT(*) as count FROM {} {}", table, where_clause);
     let mut count_query = sqlx::query(&count_sql);
     for b in &bindings {
-        count_query = count_query.bind(b);
+        count_query = match b {
+            DbValue::String(v) => count_query.bind(v),
+            DbValue::Int(v) => count_query.bind(v),
+            DbValue::Float(v) => count_query.bind(v),
+            DbValue::Bool(v) => {
+                if driver == "mysql" {
+                    count_query.bind(if *v { 1i32 } else { 0i32 })
+                } else {
+                    count_query.bind(*v)
+                }
+            }
+            DbValue::Null => count_query.bind(None::<String>),
+        };
     }
     let count_row = count_query.fetch_one(pool).await?;
     let total: i64 = count_row.try_get("count")?;
@@ -395,7 +516,19 @@ pub async fn find_paginated<T: OrmModel>(
 
     let mut data_query = sqlx::query(&sql);
     for b in bindings {
-        data_query = data_query.bind(b);
+        data_query = match b {
+            DbValue::String(v) => data_query.bind(v),
+            DbValue::Int(v) => data_query.bind(v),
+            DbValue::Float(v) => data_query.bind(v),
+            DbValue::Bool(v) => {
+                if driver == "mysql" {
+                    data_query.bind(if v { 1i32 } else { 0i32 })
+                } else {
+                    data_query.bind(v)
+                }
+            }
+            DbValue::Null => data_query.bind(None::<String>),
+        };
     }
     data_query = data_query.bind(per_page as i64);
     data_query = data_query.bind(offset as i64);
@@ -443,18 +576,25 @@ pub struct WithChildren<P, C> {
 /// // Ambil semua Post dengan user_id = 5
 /// let posts = find_by::<Post>(&pool, "user_id", "5").await?;
 /// ```
+/// Mengambil semua record dari tabel T di mana `column = value`.
+///
+/// Untuk PostgreSQL, kolom di-cast ke TEXT agar kompatibel dengan berbagai tipe data (integer, boolean, dll).
 pub async fn find_by<T: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     column: &str,
     value: &str,
 ) -> Result<Vec<T>, sqlx::Error> {
-    let sql = format!("SELECT * FROM {} WHERE {} = ?", T::TABLE, column);
+    let is_pg = driver == "postgres" || driver == "postgresql";
+    let col_expr = if is_pg {
+        format!("{}::TEXT", column)
+    } else {
+        column.to_string()
+    };
+    let sql = format!("SELECT * FROM {} WHERE {} = {}", T::TABLE, col_expr, ph(1, driver));
     println!("[ORM] FIND BY SQL: {} ({}={})", sql, column, value);
 
-    let rows = sqlx::query(&sql)
-        .bind(value)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(&sql).bind(value).fetch_all(pool).await?;
 
     rows.into_iter()
         .map(|r| T::from_row(r))
@@ -474,15 +614,25 @@ pub async fn find_by<T: OrmModel>(
 /// ```
 pub async fn find_by_paginated<T: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     column: &str,
     value: &str,
     page: u64,
     per_page: u64,
 ) -> Result<PaginatedResult<T>, sqlx::Error> {
     let table = T::TABLE;
+    let is_pg = driver == "postgres" || driver == "postgresql";
+    let col_expr = if is_pg {
+        format!("{}::TEXT", column)
+    } else {
+        column.to_string()
+    };
 
     // Total record yang cocok
-    let count_sql = format!("SELECT COUNT(*) as count FROM {} WHERE {} = ?", table, column);
+    let count_sql = format!(
+        "SELECT COUNT(*) as count FROM {} WHERE {} = {}",
+        table, col_expr, ph(1, driver)
+    );
     let count_row = sqlx::query(&count_sql).bind(value).fetch_one(pool).await?;
     let total = count_row.try_get::<i64, _>("count")? as u64;
 
@@ -490,8 +640,20 @@ pub async fn find_by_paginated<T: OrmModel>(
     let offset = (page - 1) * per_page;
     let total_pages = total.div_ceil(per_page);
 
-    let sql = format!("SELECT * FROM {} WHERE {} = ? LIMIT ? OFFSET ?", table, column);
-    println!("[ORM] FIND BY PAGINATED: {} ({}={}, limit={}, offset={})", sql, column, value, per_page, offset);
+    let (limit_ph, offset_ph) = if is_pg {
+        (ph(2, driver), ph(3, driver))
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+
+    let sql = format!(
+        "SELECT * FROM {} WHERE {} = {} LIMIT {} OFFSET {}",
+        table, col_expr, ph(1, driver), limit_ph, offset_ph
+    );
+    println!(
+        "[ORM] FIND BY PAGINATED: {} ({}={}, limit={}, offset={})",
+        sql, column, value, per_page, offset
+    );
 
     let rows = sqlx::query(&sql)
         .bind(value)
@@ -505,7 +667,13 @@ pub async fn find_by_paginated<T: OrmModel>(
         .map(|r| T::from_row(r))
         .collect::<Result<Vec<T>, _>>()?;
 
-    Ok(PaginatedResult { data, page, per_page, total, total_pages })
+    Ok(PaginatedResult {
+        data,
+        page,
+        per_page,
+        total,
+        total_pages,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,19 +695,17 @@ pub async fn find_by_paginated<T: OrmModel>(
 /// ```
 pub async fn find_related<Child: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     fk_column: &str,
     parent_id: i64,
 ) -> Result<Vec<Child>, sqlx::Error> {
-    let sql = format!(
-        "SELECT * FROM {} WHERE {} = ?",
-        Child::TABLE, fk_column
+    let sql = format!("SELECT * FROM {} WHERE {} = {}", Child::TABLE, fk_column, ph(1, driver));
+    println!(
+        "[ORM] FIND RELATED SQL: {} ({}={})",
+        sql, fk_column, parent_id
     );
-    println!("[ORM] FIND RELATED SQL: {} ({}={})", sql, fk_column, parent_id);
 
-    let rows = sqlx::query(&sql)
-        .bind(parent_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(&sql).bind(parent_id).fetch_all(pool).await?;
 
     rows.into_iter()
         .map(|r| Child::from_row(r))
@@ -568,29 +734,29 @@ pub async fn find_related<Child: OrmModel>(
 /// ```
 pub async fn find_many_to_many<T: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     pivot_table: &str,
     pivot_fk: &str,
     pivot_ref: &str,
     ref_id: i64,
 ) -> Result<Vec<T>, sqlx::Error> {
     let target_table = T::TABLE;
+    let ph1 = ph(1, driver);
 
     // JOIN tabel target dengan pivot, filter berdasarkan ref_id
     let sql = format!(
-        "SELECT {t}.* FROM {t} \
-         INNER JOIN {pivot} ON {pivot}.{fk} = {t}.id \
-         WHERE {pivot}.{pref} = ?",
-        t = target_table,
+        "SELECT {target}.* FROM {target} \
+         INNER JOIN {pivot} ON {pivot}.{fk} = {target}.id \
+         WHERE {pivot}.{pref} = {ph}",
+        target = target_table,
         pivot = pivot_table,
         fk = pivot_fk,
         pref = pivot_ref,
+        ph = ph1,
     );
     println!("[ORM] MANY-TO-MANY SQL: {} ({}={})", sql, pivot_ref, ref_id);
 
-    let rows = sqlx::query(&sql)
-        .bind(ref_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(&sql).bind(ref_id).fetch_all(pool).await?;
 
     rows.into_iter()
         .map(|r| T::from_row(r))
@@ -625,15 +791,75 @@ pub async fn find_many_to_many<T: OrmModel>(
 /// ```
 pub async fn find_one_with_related<P: OrmModel, C: OrmModel>(
     pool: &Pool<Any>,
+    driver: &str,
     parent_id: i64,
     fk_column: &str,
 ) -> Result<Option<WithChildren<P, C>>, sqlx::Error> {
     // 1. Cari parent terlebih dahulu
-    let parent = find_one::<P>(pool, parent_id).await?;
-    let Some(parent) = parent else { return Ok(None) };
+    let parent = find_one::<P>(pool, driver, parent_id).await?;
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
 
     // 2. Cari semua child yang ber-relasi
-    let children = find_related::<C>(pool, fk_column, parent_id).await?;
+    let children = find_related::<C>(pool, driver, fk_column, parent_id).await?;
 
     Ok(Some(WithChildren { parent, children }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIT TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ph_sqlite() {
+        assert_eq!(ph(1, "sqlite"), "?");
+        assert_eq!(ph(5, "sqlite"), "?");
+        assert_eq!(ph(100, "sqlite"), "?");
+    }
+
+    #[test]
+    fn test_ph_mysql() {
+        assert_eq!(ph(1, "mysql"), "?");
+        assert_eq!(ph(3, "mysql"), "?");
+    }
+
+    #[test]
+    fn test_ph_postgres() {
+        assert_eq!(ph(1, "postgres"), "$1");
+        assert_eq!(ph(3, "postgres"), "$3");
+        assert_eq!(ph(10, "postgres"), "$10");
+        assert_eq!(ph(1, "postgresql"), "$1");
+        assert_eq!(ph(2, "postgresql"), "$2");
+    }
+
+    #[test]
+    fn test_make_placeholders_sqlite() {
+        assert_eq!(make_placeholders(1, "sqlite"), "?");
+        assert_eq!(make_placeholders(3, "sqlite"), "?, ?, ?");
+        assert_eq!(make_placeholders(5, "sqlite"), "?, ?, ?, ?, ?");
+    }
+
+    #[test]
+    fn test_make_placeholders_mysql() {
+        assert_eq!(make_placeholders(2, "mysql"), "?, ?");
+        assert_eq!(make_placeholders(4, "mysql"), "?, ?, ?, ?");
+    }
+
+    #[test]
+    fn test_make_placeholders_postgres() {
+        assert_eq!(make_placeholders(1, "postgres"), "$1");
+        assert_eq!(make_placeholders(3, "postgres"), "$1, $2, $3");
+        assert_eq!(make_placeholders(2, "postgresql"), "$1, $2");
+    }
+
+    #[test]
+    fn test_make_placeholders_empty() {
+        assert_eq!(make_placeholders(0, "sqlite"), "");
+        assert_eq!(make_placeholders(0, "postgres"), "");
+    }
 }
